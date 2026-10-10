@@ -1,7 +1,19 @@
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
+
+try:
+    from google import genai
+    # pyrefly: ignore [missing-import]
+    from google.genai import types
+    IMPORT_ERROR = None
+except Exception as _e:  # surfaced in the UI / diag endpoint
+    genai = types = None
+    IMPORT_ERROR = str(_e)
+
+POOL = ThreadPoolExecutor(max_workers=8)
 
 app = Flask(__name__)
 CORS(app)
@@ -12,14 +24,15 @@ CORS(app)
 # Override the primary with a GEMINI_MODEL env var on Vercel if you like.
 # (gemini-2.5-* models shut down Oct 16, 2026 - don't use them.)
 # ---------------------------------------------------------------------------
-PRIMARY_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
-FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3.1-flash-lite"]
+# Fastest model first. If it stalls or is busy we move on quickly.
+PRIMARY_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
+FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3.8-flash"]
 MODELS = [PRIMARY_MODEL] + [m for m in FALLBACK_MODELS if m != PRIMARY_MODEL]
 
 ATTEMPTS_PER_MODEL = 2
-RETRY_DELAY_SECONDS = 1.0
-REQUEST_TIMEOUT_MS = 40000
-TOTAL_BUDGET_SECONDS = 50
+RETRY_DELAY_SECONDS = 0.5
+PER_MODEL_TIMEOUT = 28          # seconds to wait for one model's full answer
+TOTAL_BUDGET_SECONDS = 50       # stop starting new attempts after this
 RETRYABLE_CODES = {429, 500, 502, 503, 504}
 
 # Shorter reports = faster. Users pick this in the UI.
@@ -332,76 +345,39 @@ def get_error_code(exc):
     return None
 
 
-def text_chunks(stream):
-    for chunk in stream:
-        try:
-            t = chunk.text
-        except Exception:
-            t = None
-        if t:
-            yield t
+def make_client(api_key):
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=PER_MODEL_TIMEOUT * 1000),
+    )
 
 
-def open_stream(client, types, model, prompt, state):
-    """Start a streaming call and wait for the first piece of text.
-    Uses low 'thinking' for speed; silently drops it if the model rejects it."""
-    options = [True, False] if state["thinking"] else [False]
-    for use_thinking in options:
-        config = None
-        if use_thinking:
-            try:
-                config = types.GenerateContentConfig(
-                    thinking_config=types.ThinkingConfig(thinking_level="low")
-                )
-            except Exception:
-                config = None
-        try:
-            stream = client.models.generate_content_stream(
-                model=model, contents=prompt, config=config
-            )
-            gen = text_chunks(stream)
-            try:
-                first = next(gen)
-            except StopIteration:
-                raise RuntimeError("empty response")
-            return gen, first
-        except Exception as e:
-            if use_thinking and get_error_code(e) == 400 and "think" in str(e).lower():
-                state["thinking"] = False
-                continue
-            raise
-    raise RuntimeError("could not open stream")
+def call_model(client, model, prompt):
+    resp = client.models.generate_content(model=model, contents=prompt)
+    return (resp.text or "").strip()
+
+
+def setup_error():
+    if not os.environ.get("GEMINI_API_KEY"):
+        return ("GEMINI_API_KEY is not set. Add it in Vercel > Project > "
+                "Settings > Environment Variables, then redeploy.")
+    if IMPORT_ERROR:
+        return ("The 'google-genai' package failed to load: " + IMPORT_ERROR +
+                "\nMake sure requirements.txt contains google-genai and redeploy.")
+    return None
 
 
 @app.route('/api/research', methods=['POST'])
 def research():
     data = request.get_json(silent=True) or {}
-    topic = (data.get('topic') or '').strip() or 'Artificial Intelligence'
-    topic = topic[:300]
+    topic = ((data.get('topic') or '').strip() or 'Artificial Intelligence')[:300]
     length = LENGTHS.get(data.get('depth'), LENGTHS["standard"])
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        return jsonify({
-            "error": "GEMINI_API_KEY is not set. Add it in Vercel > Project > "
-                     "Settings > Environment Variables, then redeploy."
-        }), 500
+    err = setup_error()
+    if err:
+        return jsonify({"error": err}), 500
 
-    try:
-        from google import genai
-        # pyrefly: ignore [missing-import]
-        from google.genai import types
-    except ImportError:
-        return jsonify({
-            "error": "The 'google-genai' package is missing. Add it to "
-                     "requirements.txt and redeploy."
-        }), 500
-
-    client = genai.Client(
-        api_key=api_key,
-        http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
-    )
-
+    client = make_client(os.environ["GEMINI_API_KEY"])
     prompt = (
         f"Write a professional technical report in Markdown on: {topic}.\n"
         f"Length: {length}. Be dense and specific, no filler.\n"
@@ -414,61 +390,85 @@ def research():
 
     start = time.time()
     attempts = 0
-    last_error = "Unknown error"
-    state = {"thinking": True}
+    log = []          # what happened with each model, shown if everything fails
+    out_of_time = False
 
     for model in MODELS:
-        delay = RETRY_DELAY_SECONDS
+        if out_of_time:
+            break
         for attempt in range(ATTEMPTS_PER_MODEL):
-            if time.time() - start > TOTAL_BUDGET_SECONDS:
-                last_error = "Timed out while waiting for Gemini."
+            remaining = TOTAL_BUDGET_SECONDS - (time.time() - start)
+            if remaining < 5:
+                out_of_time = True
+                log.append("Ran out of time budget.")
                 break
+
             attempts += 1
+            wait = min(PER_MODEL_TIMEOUT, remaining)
+            fut = POOL.submit(call_model, client, model, prompt)
             try:
-                gen, first = open_stream(client, types, model, prompt, state)
-
-                def body(gen=gen, first=first):
-                    try:
-                        yield first
-                        for piece in gen:
-                            yield piece
-                    except Exception as e:
-                        yield f"\n\n---\n**Stream interrupted:** {e}"
-
-                return Response(body(), mimetype='text/plain; charset=utf-8', headers={
-                    "X-Model": model,
-                    "X-Attempts": str(attempts),
-                    "Cache-Control": "no-cache, no-transform",
-                    "X-Accel-Buffering": "no",
-                })
-
+                text = fut.result(timeout=wait)
+                if text:
+                    return Response(text, mimetype='text/plain; charset=utf-8', headers={
+                        "X-Model": model,
+                        "X-Attempts": str(attempts),
+                        "Cache-Control": "no-store",
+                    })
+                log.append(f"{model}: empty response")
+                break
+            except FutTimeout:
+                log.append(f"{model}: no answer within {int(wait)}s")
+                break  # stalled -> next model
             except Exception as e:
                 code = get_error_code(e)
-                last_error = f"{model}: {e}"
+                msg = str(e).replace("\n", " ")[:220]
+                log.append(f"{model}: {msg}")
 
-                if code in (400, 401, 403):
+                if code in (401, 403) or "api key" in msg.lower():
                     return jsonify({
-                        "error": "Gemini rejected the request (check that "
-                                 "GEMINI_API_KEY is valid and the Gemini API is "
-                                 f"enabled for it).\nDetails: {e}"
+                        "error": "Gemini rejected your API key. Check that "
+                                 "GEMINI_API_KEY is valid in Vercel.\n" + msg
                     }), 502
-
-                if code == 404:
-                    break  # model name not available -> next model
-
-                if code in RETRYABLE_CODES or code is None:
-                    if attempt < ATTEMPTS_PER_MODEL - 1:
-                        time.sleep(delay)
-                        delay *= 2
+                if code in (404, 400):
+                    break  # bad model name/request -> next model
+                if attempt < ATTEMPTS_PER_MODEL - 1:
+                    time.sleep(RETRY_DELAY_SECONDS)
                     continue
-                break
 
     return jsonify({
-        "error": "All Gemini models are busy or unavailable right now. "
-                 "This is a temporary capacity issue on Google's side, not a "
-                 "problem with your key. Please wait a minute and try again.\n\n"
-                 f"Last error: {last_error}"
+        "error": "Could not get a report from any Gemini model.\n\n"
+                 "What happened:\n- " + "\n- ".join(log) +
+                 "\n\nOpen /api/diag on your site to test each model."
     }), 503
+
+
+@app.route('/api/diag')
+def diag():
+    """Quick health check: tests each model with a tiny prompt."""
+    err = setup_error()
+    info = {"key_present": bool(os.environ.get("GEMINI_API_KEY")),
+            "import_error": IMPORT_ERROR, "models": MODELS}
+    if err:
+        info["error"] = err
+        return jsonify(info), 500
+
+    client = make_client(os.environ["GEMINI_API_KEY"])
+    t0 = {}
+    futs = {}
+    for m in MODELS:
+        t0[m] = time.time()
+        futs[m] = POOL.submit(call_model, client, m, "Reply with just: OK")
+    results = {}
+    for m, f in futs.items():
+        try:
+            out = f.result(timeout=max(1, 20 - (time.time() - min(t0.values()))))
+            results[m] = {"ok": True, "seconds": round(time.time() - t0[m], 1), "reply": out[:30]}
+        except FutTimeout:
+            results[m] = {"ok": False, "error": "no answer within 20s"}
+        except Exception as e:
+            results[m] = {"ok": False, "error": str(e)[:300]}
+    info["results"] = results
+    return jsonify(info), 200
 
 
 if __name__ == '__main__':
