@@ -83,7 +83,7 @@ def research():
         api_key = os.environ.get("GEMINI_API_KEY")
         client = genai.Client(api_key=api_key)
         
-        # Updated to active model endpoint
+        # Explicitly updated to gemini-3.8-flash as required by the API error
         response = client.models.generate_content(
             model='gemini-3.8-flash',
             contents=f"Generate a professional, structured technical report on: {topic}. Include sections for Executive Summary, Technical Architecture, and Future Outlook."
