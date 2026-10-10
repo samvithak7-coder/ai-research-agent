@@ -80,12 +80,12 @@ def research():
 
     try:
         from google import genai
-        # Pulls your Gemini API key from Vercel's environment settings securely
         api_key = os.environ.get("GEMINI_API_KEY")
         client = genai.Client(api_key=api_key)
         
+        # Updated to active model endpoint
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.8-flash',
             contents=f"Generate a professional, structured technical report on: {topic}. Include sections for Executive Summary, Technical Architecture, and Future Outlook."
         )
         report = response.text.strip()
@@ -94,6 +94,5 @@ def research():
 
     return jsonify({"report": report}), 200
 
-# Required for local testing if needed, Vercel maps serverless routing automatically
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
